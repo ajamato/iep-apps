@@ -307,4 +307,24 @@ class DruidClientSuite extends FunSuite {
     assert(json.contains("doubleSum"))
     assert(!json.contains("aggrType"))
   }
+
+  private def executeTimeseriesRequest: List[GroupByDatapoint] = {
+    import com.netflix.atlas.core.util.Streams.*
+    val file = "timeseriesResponse60sStep.json"
+    val payload = Using.resource(resource(file))(byteArray)
+    val response = HttpResponse(StatusCodes.OK, entity = payload)
+
+    val client = newClient(Success(response))
+    val query = TimeseriesQuery(
+        "ds_1", List("2019-01-10T11:00:00Z/2019-01-10T12:00:00Z"), List(Aggregation("doubleSum","m1")))
+
+    val future = client.timeseries(query).runWith(Sink.head)
+    Await.result(future, Duration.Inf)
+  }
+
+  test("simple timeseries query") {
+    val datapoints = executeTimeseriesRequest
+    assertEquals(datapoints.size, 60)
+  }
+
 }

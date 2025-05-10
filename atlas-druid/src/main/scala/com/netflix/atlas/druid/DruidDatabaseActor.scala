@@ -20,26 +20,13 @@ import org.apache.pekko.NotUsed
 import org.apache.pekko.actor.Actor
 import org.apache.pekko.actor.ActorRef
 import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.stream.scaladsl.Sink
 import org.apache.pekko.stream.scaladsl.Source
-import com.netflix.atlas.pekko.AccessLogger
 import com.netflix.atlas.core.index.TagQuery
-import com.netflix.atlas.core.model.ArrayTimeSeq
-import com.netflix.atlas.core.model.ConsolidationFunction
-import com.netflix.atlas.core.model.DataExpr
-import com.netflix.atlas.core.model.DefaultSettings
-import com.netflix.atlas.core.model.DsType
-import com.netflix.atlas.core.model.EvalContext
-import com.netflix.atlas.core.model.LazyTimeSeries
-import com.netflix.atlas.core.model.Query
+import com.netflix.atlas.core.model.{ArrayTimeSeq, ConsolidationFunction, DataExpr, DefaultSettings, DsType, EvalContext, LazyTimeSeries, Query, ResultSet, SummaryStats, Tag, TagKey, TimeSeries}
 import com.netflix.atlas.core.model.Query.KeyQuery
 import com.netflix.atlas.core.model.Query.KeyValueQuery
 import com.netflix.atlas.core.model.Query.PatternQuery
-import com.netflix.atlas.core.model.SummaryStats
-import com.netflix.atlas.core.model.Tag
-import com.netflix.atlas.core.model.TagKey
-import com.netflix.atlas.core.model.TimeSeries
 import com.netflix.atlas.core.util.ArrayHelper
 import com.netflix.atlas.core.util.ListHelper
 import com.netflix.atlas.json.Json
@@ -54,7 +41,7 @@ import scala.concurrent.duration.*
 import scala.util.Failure
 import scala.util.Success
 
-class DruidDatabaseActor(config: Config, service: DruidMetadataService)
+class DruidDatabaseActor(config: Config, service: DruidMetadataService, client: DruidClient)
     extends Actor
     with StrictLogging {
 
@@ -68,9 +55,6 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService)
   import com.netflix.atlas.webapi.TagsApi.*
 
   private implicit val sys: ActorSystem = context.system
-
-  private val client =
-    new DruidClient(config.getConfig("atlas.druid"), sys, Http().superPool[AccessLogger]())
 
   private val maxDataSize = config.getBytes("atlas.druid.max-data-size")
 
@@ -89,8 +73,10 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService)
 
   def receive: Receive = {
     case Tick        => refreshMetadata(sender())
-    case m: Metadata => metadata = Metadata(m.datasources.filter(_.nonEmpty))
-
+    case m: Metadata => {
+      metadata = Metadata(m.datasources.filter(_.nonEmpty))
+      sender() ! "metadata_updated"
+    }
     case ListTagsRequest(tq)   => listValues(sendTags(sender()), tq)
     case ListKeysRequest(tq)   => listKeys(sender(), tq)
     case ListValuesRequest(tq) => listValues(sendValues(sender()), tq)
@@ -313,10 +299,12 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService)
         .runWith(Sink.head)
         .onComplete {
           case Success(data) => ref ! DataResponse(data)
-          case Failure(t)    => ref ! Failure(t)
+          case Failure(t)    =>
+            ref ! Failure(t)
         }
     } catch {
-      case e: Exception => ref ! Failure(e)
+      case e: Exception =>
+        ref ! Failure(e)
     }
   }
 
@@ -335,7 +323,7 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService)
 
     val druidQueries = toDruidQueries(metadata, druidQueryContext, fetchContext, expr).map {
       case (tags, metric, groupByQuery) =>
-        val druidStep = math.max(metric.primaryStep, fetchContext.step)
+        val druidStep = metric.primaryStep
         val metricContext = withStep(fetchContext, druidStep)
         // For sketches just use the distinct count, other types are assumed to be counters.
         val valueMapper =
@@ -343,7 +331,9 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService)
             (v: Double) => v
           else
             createValueMapper(normalizeRates, metricContext, expr)
-        client.data(groupByQuery).map { result =>
+        // TODO can we mock client.
+        val data = client.data(groupByQuery)
+        data.map { result =>
           val candidates = toTimeSeries(tags, metricContext, result, maxDataSize, valueMapper)
           // See behavior on multi-value dimensions:
           // http://druid.io/docs/latest/querying/groupbyquery.html
@@ -355,22 +345,13 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService)
           // results are included.
           val matchingSeries = candidates.filter(ts => query.couldMatch(ts.tags))
 
-          // Some data may be at a higher resolution than others, if the step for the
-          // output is higher resolution than a metric supports, spread it out so it
-          // can be compared with the other signals.
-          val series =
-            if (fetchContext.step == metricContext.step) matchingSeries
-            else {
-              matchingSeries.map { ts =>
-                val seq = new ReduceStepTimeSeq(ts.data, fetchContext.step)
-                LazyTimeSeries(ts.tags, ts.label, seq)
-              }
-            }
-
-          // Apply offset if present
-          if (offset == 0L) series else series.map(_.offset(offset))
+          // Ignore the step size on the query parameter
+          // Always use the step size (granularity) from the metric's datasource in Druid.
+          if (offset == 0L) matchingSeries else matchingSeries.map(_.offset(offset))
         }
     }
+
+    // TODO error out if the metrics don't all have the same step
 
     // Filtering should have already been done at this point, just focus on the aggregation
     // behavior when evaluating the results. The query is simplified to exact matches that
@@ -378,6 +359,8 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService)
     //
     // For :count, we rewrite to sum at this stage because the count will be computed on druid
     // and the final result should be summed.
+//    druidQueries.headOption.map(_.)
+//    val evaluateContextContext = withStep(fetchContext, )
     val evalExpr = expr
       .rewrite {
         case _: Query => simplifyExact(expr.query)
@@ -387,11 +370,27 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService)
       }
       .asInstanceOf[DataExpr]
 
-    Source(druidQueries)
-      .flatMapMerge(Int.MaxValue, v => v)
-      .fold(List.empty[TimeSeries])(_ ::: _)
-      .map { ts =>
-        evalExpr.eval(context, ts).data
+    //val druidContext = withStep(context, druidStep)
+    val source = Source(druidQueries)
+    source
+      .flatMapMerge(Int.MaxValue,
+        v => v
+      )
+      .fold(List.empty[TimeSeries])(
+        _ ::: _
+      )
+      .map { ts => // TODO debug. ts has a 60000 step here
+        // This will error out if multiple queried timeseries have different step sizes
+        // TODO make it a more clear error message?
+        // The steps size will get a value from Looks like the step size will be always 5000 if omitted when
+        // Note: The step size on context will be 5000 if not set, which is a default that comes from
+        // DefaultSettings
+
+        // All timeseries should have the same step, if not the request would have already failed.
+        val step = ts.headOption.map(_.data.step).getOrElse(context.step)
+        val druidContext = withStep(context, step)
+        val evaluated: ResultSet = evalExpr.eval(druidContext, ts)
+        evaluated.data // TODO debug. But after we run it through this, it has a 60000 step here
       }
   }
 
@@ -628,6 +627,7 @@ object DruidDatabaseActor {
     )
   }
 
+  // TODO, do we need to handle the step size of a metric changing? I.e. when druid datasource is updated
   def toDruidQueries(
     metadata: Metadata,
     druidQueryContext: Map[String, String],
@@ -646,7 +646,7 @@ object DruidDatabaseActor {
         val name = m.tags("name")
         val datasource = m.tags("nf.datasource")
 
-        val druidStep = math.max(m.metric.primaryStep, context.step)
+        val druidStep = m.metric.primaryStep
         val druidContext = withStep(context, druidStep)
         val intervals = List(toInterval(druidContext))
 

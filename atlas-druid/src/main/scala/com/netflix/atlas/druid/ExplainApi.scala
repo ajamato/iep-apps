@@ -48,6 +48,7 @@ class ExplainApi(config: Config, implicit val actorRefFactory: ActorRefFactory) 
     endpointPath("explain" / "v1" / "graph") {
       get { ctx =>
         val graphCfg = grapher.toGraphConfig(ctx.request)
+        println("alexamato dbg ExplainApi get called")
         dbRef
           .ask(ExplainRequest(DataRequest(graphCfg)))(Timeout(10.seconds))
           .map { response =>
