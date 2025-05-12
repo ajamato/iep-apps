@@ -177,13 +177,7 @@ class DruidClient(
     Source
       .single(mkRequest(query))
       .via(loggingClient)
-      .map(
-        data => {
-          val str : String = new String(data.toArrayUnsafe(), "UTF-8")
-          println(str)
-          parseResult(dimensions, timer, data)
-        }
-      )
+      .map(data => parseResult(dimensions, timer, data))
   }
 
   def timeseries(query: TimeseriesQuery): Source[List[GroupByDatapoint], NotUsed] = {
@@ -192,12 +186,7 @@ class DruidClient(
       .via(loggingClient)
       .map { data =>
         Using.resource(inputStream(data)) { in =>
-          val decodedJson = Json.decode[List[TimeseriesDatapoint]](in)
-          val encodedBack = Json.encode(decodedJson)
-          println(encodedBack)
-          val str = decodedJson.toString()
-          println(str)
-          decodedJson
+          Json.decode[List[TimeseriesDatapoint]](in)
         }
       }
       .map(_.map(_.toGroupByDatapoint))

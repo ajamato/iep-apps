@@ -23,7 +23,18 @@ import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.stream.scaladsl.Sink
 import org.apache.pekko.stream.scaladsl.Source
 import com.netflix.atlas.core.index.TagQuery
-import com.netflix.atlas.core.model.{ArrayTimeSeq, ConsolidationFunction, DataExpr, DefaultSettings, DsType, EvalContext, LazyTimeSeries, Query, ResultSet, SummaryStats, Tag, TagKey, TimeSeries}
+import com.netflix.atlas.core.model.ArrayTimeSeq
+import com.netflix.atlas.core.model.ConsolidationFunction
+import com.netflix.atlas.core.model.DataExpr
+import com.netflix.atlas.core.model.DefaultSettings
+import com.netflix.atlas.core.model.DsType
+import com.netflix.atlas.core.model.EvalContext
+import com.netflix.atlas.core.model.Query
+import com.netflix.atlas.core.model.ResultSet
+import com.netflix.atlas.core.model.SummaryStats
+import com.netflix.atlas.core.model.Tag
+import com.netflix.atlas.core.model.TagKey
+import com.netflix.atlas.core.model.TimeSeries
 import com.netflix.atlas.core.model.Query.KeyQuery
 import com.netflix.atlas.core.model.Query.KeyValueQuery
 import com.netflix.atlas.core.model.Query.PatternQuery
@@ -299,12 +310,10 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService, client: 
         .runWith(Sink.head)
         .onComplete {
           case Success(data) => ref ! DataResponse(data)
-          case Failure(t)    =>
-            ref ! Failure(t)
+          case Failure(t)    => ref ! Failure(t)
         }
     } catch {
-      case e: Exception =>
-        ref ! Failure(e)
+      case e: Exception => ref ! Failure(e)
     }
   }
 
@@ -323,6 +332,8 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService, client: 
 
     val druidQueries = toDruidQueries(metadata, druidQueryContext, fetchContext, expr).map {
       case (tags, metric, groupByQuery) =>
+        // Always use the step set on the druid metric from the datasource metadata.
+        // Ignore the "step" parameter on the request.
         val druidStep = metric.primaryStep
         val metricContext = withStep(fetchContext, druidStep)
         // For sketches just use the distinct count, other types are assumed to be counters.
@@ -331,9 +342,7 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService, client: 
             (v: Double) => v
           else
             createValueMapper(normalizeRates, metricContext, expr)
-        // TODO can we mock client.
-        val data = client.data(groupByQuery)
-        data.map { result =>
+        client.data(groupByQuery).map { result =>
           val candidates = toTimeSeries(tags, metricContext, result, maxDataSize, valueMapper)
           // See behavior on multi-value dimensions:
           // http://druid.io/docs/latest/querying/groupbyquery.html
@@ -351,16 +360,12 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService, client: 
         }
     }
 
-    // TODO error out if the metrics don't all have the same step
-
     // Filtering should have already been done at this point, just focus on the aggregation
     // behavior when evaluating the results. The query is simplified to exact matches that
     // are extracted to generate the labels. At this stage it is effectively true for matches.
     //
     // For :count, we rewrite to sum at this stage because the count will be computed on druid
     // and the final result should be summed.
-//    druidQueries.headOption.map(_.)
-//    val evaluateContextContext = withStep(fetchContext, )
     val evalExpr = expr
       .rewrite {
         case _: Query => simplifyExact(expr.query)
@@ -370,27 +375,15 @@ class DruidDatabaseActor(config: Config, service: DruidMetadataService, client: 
       }
       .asInstanceOf[DataExpr]
 
-    //val druidContext = withStep(context, druidStep)
-    val source = Source(druidQueries)
-    source
-      .flatMapMerge(Int.MaxValue,
-        v => v
-      )
-      .fold(List.empty[TimeSeries])(
-        _ ::: _
-      )
-      .map { ts => // TODO debug. ts has a 60000 step here
-        // This will error out if multiple queried timeseries have different step sizes
-        // TODO make it a more clear error message?
-        // The steps size will get a value from Looks like the step size will be always 5000 if omitted when
-        // Note: The step size on context will be 5000 if not set, which is a default that comes from
-        // DefaultSettings
-
-        // All timeseries should have the same step, if not the request would have already failed.
+    Source(druidQueries)
+      .flatMapMerge(Int.MaxValue, v => v)
+      .fold(List.empty[TimeSeries])(_ ::: _)
+      .map { ts =>
+        // All timeseries must have the same step at this point, if not the request would have already failed.
+        // Ignore the "step" parameter on the request, use the step on the metrics.
         val step = ts.headOption.map(_.data.step).getOrElse(context.step)
         val druidContext = withStep(context, step)
-        val evaluated: ResultSet = evalExpr.eval(druidContext, ts)
-        evaluated.data // TODO debug. But after we run it through this, it has a 60000 step here
+        evalExpr.eval(druidContext, ts).data
       }
   }
 
@@ -627,7 +620,6 @@ object DruidDatabaseActor {
     )
   }
 
-  // TODO, do we need to handle the step size of a metric changing? I.e. when druid datasource is updated
   def toDruidQueries(
     metadata: Metadata,
     druidQueryContext: Map[String, String],

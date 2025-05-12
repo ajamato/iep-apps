@@ -16,7 +16,8 @@
 package com.netflix.atlas.druid
 
 import com.netflix.atlas.pekko.AccessLogger
-import com.typesafe.config.{Config, ConfigFactory}
+import com.typesafe.config.Config
+import com.typesafe.config.ConfigFactory
 import org.apache.pekko.actor.ActorSystem
 
 import java.util.Optional
@@ -32,15 +33,12 @@ class AppConfiguration {
     new DruidMetadataService
   }
 
-  // TODO when you try to inject config it fails spectacularly with an unhelpful error message
-  // why is this, why can't we inject Config. Why does it work in the other project?
   @Bean
   def druidClient(config: Optional[Config], system: ActorSystem): DruidClient = {
     val c = config.orElseGet(() => ConfigFactory.load())
-    println(c)
 
     implicit val sys: ActorSystem = system
 
-    new DruidClient(c.getConfig("atlas.druid"), sys, Http().superPool[AccessLogger]())
+    new DruidClient(c.getConfig("atlas.druid"), system, Http().superPool[AccessLogger]())
   }
 }
